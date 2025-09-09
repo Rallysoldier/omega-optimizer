@@ -1,0 +1,2 @@
+Enter Firerate For Force Apply = 1800
+Enemy Multiplier = 2
