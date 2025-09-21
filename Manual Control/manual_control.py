@@ -10,7 +10,7 @@ BRIDGE_FILE = Path(r"C:\Users\Public\hd2_bridge.txt")
 # ======= Globals / limits / steps =======
 FIRERATE_DEFAULT = 3000
 FIRERATE_MAX     = 8000
-FIRERATE_MIN     = 1000
+FIRERATE_MIN     = 200
 FIRERATE_INC            = 1000
 FIRERATE_DEC            = -1000
 FIRERATE_INC_FINETUNE   = 500
@@ -24,16 +24,25 @@ SPEED_DEC            = -1
 SPEED_INC_FINETUNE   = 0.5
 SPEED_DEC_FINETUNE   = -0.5
 
-RAND_MIN_INTERVAL = 15
+# ----- Random -----
+RAND_MIN_INTERVAL = 4
 RAND_MAX_INTERVAL = 60
 # ----- Random mode ranges (independent of normal clamps) -----
+RAND_FIRERATE_MAX = 6000 #7000
 RAND_FIRERATE_MIN = 1000 #1000
-RAND_FIRERATE_MAX = 7000 #7000
-RAND_SPEED_MIN     = 1.6    #1.6 #1.8
-RAND_SPEED_MAX     = 4      #4
+RAND_SPEED_MAX     = 3.5      #4
+RAND_SPEED_MIN     = 1.8    #1.6 #1.8
 # ----- Random mode outlier for Enemy Multiplier -----
-RAND_SPEED_OUTLIER = 250.0         # the spike value #250 #200
-RAND_SPEED_OUTLIER_CHANCE = 0.25   # 2% chance each tick (0.0 - 1.0) #.25
+RAND_SPEED_OUTLIER = 200.0         # the spike value #250 #200
+RAND_SPEED_OUTLIER_CHANCE = 0.3   # 2% chance each tick (0.0 - 1.0) #.25
+# Variable speed outlier band for the *alt* randomizer (subtract+num 9)
+SPEED_OUTLIER_RAND_MAX = 250
+SPEED_OUTLIER_RAND_MIN = 40
+# Chain rule (applies only in the alt randomizer on subtract+num 9)
+FIRERATE_CHAIN_THRESHOLD   = 5500.0  # "6000+" triggers limiter next tick
+RAND_FIRERATE_LIMITER_MIN  = 2500
+RAND_FIRERATE_LIMITER_MAX  = 3000  # keep follow-up below 6000 by default
+
 
 # Map features to their random ranges
 RAND_BOUNDS = {
@@ -156,6 +165,81 @@ def _random_mode_worker(stop_evt: threading.Event):
     finally:
         print("[RANDOM] mode DISABLED")
 
+def _random_mode_worker_chain(stop_evt: threading.Event):
+    """
+    Alt randomizer:
+      - If last firerate written >= FIRERATE_CHAIN_THRESHOLD, next firerate is forced into
+        RAND_FIRERATE_LIMITER_MIN..RAND_FIRERATE_LIMITER_MAX.
+      - Enemy Multiplier keeps the same outlier chance, but the outlier value is sampled
+        uniformly from SPEED_OUTLIER_RAND_MIN..SPEED_OUTLIER_RAND_MAX.
+    """
+    print("[RANDOM-CHAIN] mode ENABLED")
+    prev_fr_high = False
+    try:
+        while not stop_evt.is_set():
+            vals = read_bridge()
+            outlier_hit = False
+            chain_used  = False
+
+            # === Enter Firerate For Force Apply ===
+            fr_bounds = RAND_BOUNDS["Enter Firerate For Force Apply"]
+            fr_lo, fr_hi = float(fr_bounds["min"]), float(fr_bounds["max"])
+            if prev_fr_high:
+                lo, hi = float(RAND_FIRERATE_LIMITER_MIN), float(RAND_FIRERATE_LIMITER_MAX)
+                if hi < lo: lo, hi = hi, lo
+                fr_pick = random.uniform(lo, hi)
+                chain_used = True
+            else:
+                if fr_hi < fr_lo: fr_lo, fr_hi = fr_hi, fr_lo
+                fr_pick = random.uniform(fr_lo, fr_hi)
+
+            vals["Enter Firerate For Force Apply"] = clamp("Enter Firerate For Force Apply", fr_pick)
+
+            # === Enemy Multiplier === (variable outlier band)
+            if random.random() < RAND_SPEED_OUTLIER_CHANCE:
+                lo, hi = float(SPEED_OUTLIER_RAND_MIN), float(SPEED_OUTLIER_RAND_MAX)
+                if hi < lo: lo, hi = hi, lo
+                sp_pick = random.uniform(lo, hi)
+                outlier_hit = True
+            else:
+                sp_bounds = RAND_BOUNDS["Enemy Multiplier"]
+                sp_lo, sp_hi = float(sp_bounds["min"]), float(sp_bounds["max"])
+                if sp_hi < sp_lo: sp_lo, sp_hi = sp_hi, sp_lo
+                sp_pick = random.uniform(sp_lo, sp_hi)
+
+            vals["Enemy Multiplier"] = clamp("Enemy Multiplier", sp_pick)
+
+            # write + log
+            write_bridge(vals)
+            tags = []
+            if outlier_hit: tags.append("OUTLIER")
+            if chain_used:  tags.append("CHAIN")
+            tagstr = f" [{' / '.join(tags)}]" if tags else ""
+            print(f"[RANDOM-CHAIN]{tagstr} "
+                  + " | ".join(f"{k}={fmt_value(k, vals[k])}" for k in FEATURES))
+
+            # Arm the limiter for next tick if this written firerate is >= threshold
+            prev_fr_high = (vals["Enter Firerate For Force Apply"] >= FIRERATE_CHAIN_THRESHOLD)
+
+            time.sleep(_rand_interval())
+    finally:
+        print("[RANDOM-CHAIN] mode DISABLED")
+
+
+def toggle_random_mode_chain():
+    """Alt randomizer: if last firerate >= 6000, next firerate is constrained to limiter band."""
+    global _rand_thread
+    if _rand_thread and _rand_thread.is_alive():
+        _rand_stop.set()
+        _rand_thread.join(timeout=1.0)
+        _rand_thread = None
+        _rand_stop.clear()
+    else:
+        _rand_stop.clear()
+        _rand_thread = threading.Thread(target=_random_mode_worker_chain, args=(_rand_stop,), daemon=True)
+        _rand_thread.start()
+
+
 def toggle_random_mode():
     global _rand_thread
     if _rand_thread and _rand_thread.is_alive():
@@ -190,6 +274,9 @@ HOTKEYS = [
 
     # Toggle Random Mode (numpad minus + numpad 7)
     ("subtract+num 7", toggle_random_mode),
+    # Toggle Alt Random Mode with firerate chain limiter (numpad minus + numpad 9)
+    ("subtract+num 9", toggle_random_mode_chain),
+
 ]
 
 # Optional: block keystrokes from reaching the game
